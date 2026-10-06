@@ -2,7 +2,7 @@
 
 // ?Pin Definitions
 // Motor Pins
-const uint8_t motorPWM = 6;
+const uint8_t motorPWM = 7;
 const uint8_t motorIN1 = 5;
 const uint8_t motorIN2 = 6;
 

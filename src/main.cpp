@@ -1,319 +1,249 @@
 #include <Arduino.h>
 
 // ?Pin Definitions
-// Motor Pins
-const uint8_t motorPWM = 8;
+const uint8_t motorPWM = 9;
 const uint8_t motorIN1 = 6;
 const uint8_t motorIN2 = 5;
-
-// Encoder Pins
 const int encoderA = 3;
 const int encoderB = 2;
+const uint8_t buttonPin = 10;       // Testing setup: run starts when this pin reads HIGH
 
-// Button
-const uint8_t buttonPin = 8;
+// ?Parameters
+float targetDistance = 9.0;
+float bottleLineDistance = 2.0;
+float targetTime = 20.0;
+float holdDelay = 0.0;
 
-// ?Competition Inputs (meters and seconds, change these for the randomization)
-float targetDistance = 7.50; // Start Point to Target Point
-float bottleLineDistance = 2.00; // Target Point to Bottle Line
-float targetTime = 15.0;
-float previousRunTime = 15.0; // Last measured run time with no start delay
+// ?Parameters: Vehicle
+const float ticksPerMeter = 9000;   // Calibrated encoder ticks per meter
+const float vehicleLength = 0.5; // Measurement Point center to bottle catcher center (m)
+const float bottleRadius = 0.035;   // Water Bottle diameter is 6 - 7 cm, so radius 3.0 - 3.5 cm (m)
+const float bottleMargin = 0.005;   // Extra distance for the bottle rear edge past the line (m)
+const int encoderSign = -1;          // Use -1 if position counts down when driving forward
 
-// ?Vehicle Constants
-const float ticksPerMeter = 746.27; // TODO measure
-const float vehicleLength = 0.30; // Measurement Point to pusher front
-const float bottleLocation = 3.0; // Start Point to bottle center (States)
-const float bottleDiameter = 0.065;
-const float bottleOvershoot = 0.03; // How far the bottle rear edge ends past the line
+// ?Parameters: Tuning
+const int fullPower = 255;          // Cruise power
+const int creepPower = 90;          // Power for the end of the taper and for creep pulses
+const float creepZone = 0.03;       // Taper ends and creep pulses begin this far from the goal (m)
+const float tolerance = 0.003;      // Close enough to the goal (m)
 
-// ?Movement Parameters
-const int forwardDir = 1;
+// ?Parameters: Motion Profile
+const float topSpeed = 1.0;         // Measured speed at fullPower (m / s), see the peak speed printout
+const float decelRate = 1.2;        // Planned slowdown (m / s^2), lower = earlier and gentler braking
+const float finishSpeed = 0.08;     // Speed the profile slows to near the goal (m / s)
+const float speedGain = 400;        // Power added per m / s of speed error, higher = stronger braking
+const int brakeMax = 200;           // Max reverse power used for active braking
+const float slideAllowance = 0.05;  // Forward leg ends this early because the bottle slides (m)
+const int slewPerSample = 30;       // Max drive power increase per sample, higher = harsher start
+const unsigned long sampleMs = 15;  // Speed measurement and control interval
 
-const float slowZone = 0.40; // Distance before bottle contact to slow down
-const float grabCarry = 0.15; // Distance pushed at grabPower after contact
+const int brakePower = 100;         // Brake pulse power after the taper
+const int brakeMs = 0;              // Brake pulse length, 0 for no brake (profile handles braking now)
+const int pulseMs = 40;             // Creep pulse length, long enough to be visible
+const int settleMs = 150;           // Pause after each pulse before checking position
+const unsigned long movementTimeoutMs = 30000;
 
-const int runPower = 255;
-const int grabPower = 90;
-const int pushPower = 150;
-const int backPower = 120;
-const int minPower = 60;
-
-const float rampRate = 150; // Power per second
-const float taperPerMeter = 200; // Power per meter of remaining distance
-
-const int brakePower = 90;
-const int brakeDuration = 120;
-
-const float fineTolerance = 0.002; // Meters
-const unsigned long settleTime = 300; // Milliseconds
+const float fineTuneGuard = 0.5;
 
 // ?Global Variables
-volatile long encoderPos = 0;
+volatile long encoderPosition = 0;
+unsigned long runStart;
+float worldSpeed = 0;               // Signed speed carried between legs (m / s)
+float peakSpeed = 0;
 
-long prevTime;
-long deltaTime;
-float currentPower = 0;
+enum class LedStatus { Ready, Driving, TargetReached, TimeLimit, MovementTimeout };
+enum class DriveResult { TargetReached, TimeLimit, MovementTimeout };
+LedStatus ledStatus = LedStatus::Ready;
+unsigned long ledStatusSince;
+bool runComplete = false;
 
-float contactDistance;
-float lineDistance;
-float pushDistance;
-float runDistance;
-float grabDistance;
-float finishDistance;
-float reverseDistance;
-float startDelay;
+// ?Functions
+void readEncoder() { encoderPosition += digitalRead(encoderB) ? 1 : -1; }
 
-bool waitingForButton = false;
+long getPos() { noInterrupts(); long pos = encoderPosition; interrupts(); return pos * encoderSign; }
 
-// ?Forward Declarations
-void readEncoder();
-long getEncoderPos();
+void setLedStatus(LedStatus status) {
+  ledStatus = status;
+  ledStatusSince = millis();
+}
 
-void fwd(float meters, int power, bool brakeAtEnd);
-void back(float meters, int power, bool brakeAtEnd);
-void fineAdjust(float targetMeters);
+void updateStatusLed() {
+  unsigned long phase = millis() - ledStatusSince;
+  bool ledOn = false;
 
-void moveStraight(float meters, char direction, int power, bool brakeAtEnd);
-void rampPower(float desiredPower);
-
-void setMotor(int dir, int pwmVal);
-void stopMotors();
-void applyBrake(char direction);
-
-void computeDeltaT();
-
-// ?PID Controller
-class SimplePID {
-public:
-  float kp, kd, ki, umax, umin;
-  float eprev, eintegral;
-
-  SimplePID() : kp(1), kd(0), ki(0), umax(255), umin(0), eprev(0.0), eintegral(0.0) {}
-
-  void setParams(float kpIn, float kdIn, float kiIn, float umaxIn, float uminIn) {
-    kp = kpIn;
-    kd = kdIn;
-    ki = kiIn;
-    umax = umaxIn;
-    umin = uminIn;
+  switch (ledStatus) {
+    case LedStatus::Driving:
+      ledOn = (phase / 500) % 2 == 0;
+      break;
+    case LedStatus::TargetReached:
+      phase %= 1500;
+      ledOn = phase < 150 || (phase >= 300 && phase < 450);
+      break;
+    case LedStatus::TimeLimit:
+      phase %= 1800;
+      ledOn = phase < 100 || (phase >= 200 && phase < 300) || (phase >= 400 && phase < 500);
+      break;
+    case LedStatus::MovementTimeout:
+      phase %= 2100;
+      ledOn = phase < 100 || (phase >= 200 && phase < 300) ||
+              (phase >= 400 && phase < 500) || (phase >= 600 && phase < 700);
+      break;
+    case LedStatus::Ready:
+      break;
   }
 
-  void evaluate(double value, double target, float deltaT, int &pwr, int &dir) {
-    if (deltaT <= 0) deltaT = 0.001;
-    double error = target - value;
-    float derivative = (error - eprev) / deltaT;
-    eintegral += error * deltaT;
-    float output = kp * error + kd * derivative + ki * eintegral;
+  digitalWrite(LED_BUILTIN, ledOn ? HIGH : LOW);
+}
 
-    pwr = constrain((int)fabs(output), umin, umax);
-    dir = (output < 0) ? -1 : 1;
-    eprev = error;
+void waitWithStatus(unsigned long duration) {
+  unsigned long start = millis();
+  while (millis() - start < duration) {
+    updateStatusLed();
+    delay(1);
   }
-};
+}
 
-SimplePID pidFine;
+// dir: 1 forward, -1 reverse, 0 coast
+void setMotor(int dir, int pwmValue) {
+  analogWrite(motorPWM, dir == 0 ? 0 : constrain(pwmValue, 0, 255));
+  digitalWrite(motorIN1, dir < 0);
+  digitalWrite(motorIN2, dir > 0);
+}
+
+bool timeUp() { return (millis() - runStart) / 1000.0 >= targetTime - fineTuneGuard; }
+
+DriveResult driveTo(float goalMeters, int dir, bool oneWay) {
+  unsigned long driveStart = millis();
+  long goalTicks = goalMeters * ticksPerMeter;
+  long tolTicks = tolerance * ticksPerMeter;
+  long creepTicks = creepZone * ticksPerMeter;
+  long stopTicks = oneWay ? tolTicks : creepTicks;  // One way leg hands off without stopping
+  long err;
+
+  long lastPos = getPos();
+  unsigned long lastSample = millis();
+  float speed = worldSpeed * dir;  // Speed along this leg's direction
+  float lastCmd = 0;
+  setMotor(0, 0);
+
+  while ((err = (goalTicks - getPos()) * dir) > stopTicks) {
+    if (millis() - driveStart >= movementTimeoutMs) {
+      setMotor(0, 0);
+      return DriveResult::MovementTimeout;
+    }
+
+    unsigned long now = millis();
+    if (now - lastSample >= sampleMs) {
+      long pos = getPos();
+      float dt = (now - lastSample) / 1000.0;
+      float rawSpeed = (pos - lastPos) * dir / ticksPerMeter / dt;
+      speed = 0.6 * speed + 0.4 * rawSpeed;
+      lastPos = pos;
+      lastSample = now;
+      worldSpeed = speed * dir;
+      if (speed > peakSpeed) peakSpeed = speed;
+
+      float errMeters = err / ticksPerMeter;
+      float speedLimit = min(topSpeed, max(finishSpeed, sqrt(2.0 * decelRate * errMeters)));
+      float cmd = fullPower * speedLimit / topSpeed + speedGain * (speedLimit - speed);
+
+      if (speed < finishSpeed && cmd > 0) cmd = max(cmd, (float)creepPower);  // Stay above motor deadband
+      if (cmd > lastCmd + slewPerSample) cmd = lastCmd + slewPerSample;       // Smooth drive ramp only
+      if (cmd < 0 && speed <= 0) cmd = 0;                                     // Never brake into a reverse
+      cmd = constrain(cmd, -brakeMax, fullPower);
+      lastCmd = cmd;
+
+      setMotor(cmd >= 0 ? dir : -dir, abs(cmd));
+    }
+    updateStatusLed();
+  }
+
+  if (oneWay) return DriveResult::TargetReached;
+
+  // Optional brake pulse, then let the vehicle settle
+  if (brakeMs > 0) {
+    setMotor(-dir, brakePower);
+    waitWithStatus(brakeMs);
+  }
+  setMotor(0, 0);
+  worldSpeed = 0;
+  waitWithStatus(settleMs);
+
+  // Creep pulses until within tolerance
+  while (millis() - driveStart < movementTimeoutMs) {
+    err = goalTicks - getPos();
+    if (abs(err) <= tolTicks || timeUp()) {
+      return abs(err) <= tolTicks
+                 ? DriveResult::TargetReached
+                 : DriveResult::TimeLimit;
+    }
+    setMotor(err > 0 ? 1 : -1, creepPower);
+    waitWithStatus(pulseMs);
+    setMotor(0, 0);
+    waitWithStatus(settleMs);
+  }
+
+  setMotor(0, 0);
+  return DriveResult::MovementTimeout;
+}
 
 // ?Setup
 void setup() {
   Serial.begin(9600);
-  Serial.println("Vehicle Initialization");
-
-  // Configure PID controller (power per tick)
-  pidFine.setParams(0.5, 0, 0, 100, minPower);
-
-  // Initialize Button
   pinMode(buttonPin, INPUT_PULLUP);
+  pinMode(LED_BUILTIN, OUTPUT);
+
   pinMode(motorPWM, OUTPUT);
   pinMode(motorIN1, OUTPUT);
   pinMode(motorIN2, OUTPUT);
-
-  // Initialize Encoder
   attachInterrupt(digitalPinToInterrupt(encoderA), readEncoder, RISING);
-
-  Serial.println("Initialization Successful");
-  waitingForButton = true;
+  Serial.println("Ready");
+  updateStatusLed();
 }
 
 // ?Main Loop
 void loop() {
-  // Run profile: fast run, slow down, grab bottle, speed up, stop,
-  // reverse to Target Point, fine adjust with encoder
-
-  contactDistance = bottleLocation - (bottleDiameter / 2) - vehicleLength;
-  lineDistance = targetDistance + bottleLineDistance;
-  pushDistance = lineDistance + bottleOvershoot + bottleDiameter - vehicleLength;
-
-  runDistance = max(0.0f, contactDistance - slowZone);
-  grabDistance = slowZone + grabCarry;
-  finishDistance = max(0.0f, pushDistance - runDistance - grabDistance);
-  reverseDistance = pushDistance - targetDistance;
-
-  startDelay = targetTime - previousRunTime;
-
-  while (waitingForButton) {
-    if (digitalRead(buttonPin) == 1) {
-      waitingForButton = false;
-      Serial.println("Starting Sequences");
-      delay(100); // Debounce
-    } else {
-      delay(10);
-    }
+  if (runComplete) {
+    updateStatusLed();
+    delay(10);
+    return;
   }
 
-  noInterrupts();
-  encoderPos = 0;
-  interrupts();
+  // Measurement Point position that puts the bottle just past the line
+  float bottleGoal = targetDistance + bottleLineDistance + bottleRadius + bottleMargin - vehicleLength;
 
-  unsigned long runStart = millis();
+  while (digitalRead(buttonPin) != HIGH) { updateStatusLed(); delay(1);}
+
+  runStart = millis();
+  noInterrupts();
+  encoderPosition = 0;
+  interrupts();
+  worldSpeed = 0;
+  peakSpeed = 0;
+  setLedStatus(LedStatus::Driving);
+  updateStatusLed();
 
   // ?Movement Sequence
-  if (startDelay > 0) delay(startDelay * 1000);
-
-  fwd(runDistance, runPower, false);
-  fwd(grabDistance, grabPower, false);
-  fwd(finishDistance, pushPower, true);
-
-  back(reverseDistance, backPower, true);
-  fineAdjust(targetDistance);
-
-  Serial.println("Run Time: " + String((millis() - runStart) / 1000.0));
-  Serial.println("Encoder Distance: " + String(getEncoderPos() / ticksPerMeter));
-
-  while (1) {Serial.println("Sequences Terminated"); delay(1000000);}
-}
-
-// ?Movement Commands
-void fwd(float meters, int power, bool brakeAtEnd) {
-  moveStraight(meters, 'f', power, brakeAtEnd);
-}
-
-void back(float meters, int power, bool brakeAtEnd) {
-  moveStraight(meters, 'b', power, brakeAtEnd);
-}
-
-// ?Movement Implementations
-void moveStraight(float meters, char direction, int power, bool brakeAtEnd) {
-  long startTicks = getEncoderPos();
-  long targetTicks = (long)(meters * ticksPerMeter);
-
-  if (currentPower < minPower) currentPower = minPower;
-  prevTime = millis();
-
-  while (abs(getEncoderPos() - startTicks) < targetTicks) {
-    computeDeltaT();
-
-    long remainingTicks = targetTicks - abs(getEncoderPos() - startTicks);
-    float desiredPower = power;
-
-    if (brakeAtEnd) {
-      desiredPower = min(desiredPower, minPower + (remainingTicks / ticksPerMeter) * taperPerMeter);
+  DriveResult result = driveTo(bottleGoal - slideAllowance, 1, true);
+  if (result == DriveResult::TargetReached) {
+    if (holdDelay > 0) {
+      setMotor(0, 0);
+      worldSpeed = 0;
+      waitWithStatus(holdDelay * 1000);
     }
-
-    rampPower(desiredPower);
-
-    if (direction == 'f') {
-      setMotor(forwardDir, (int)currentPower);
-    } else {
-      setMotor(-forwardDir, (int)currentPower);
-    }
+    result = driveTo(targetDistance, -1, false);
   }
 
-  if (brakeAtEnd) {
-    applyBrake(direction);
-    stopMotors();
-    currentPower = 0;
-    delay(100);
-  }
-}
+  float runTime = (millis() - runStart) / 1000.0;
+  Serial.println("Run time (s): " + String(runTime));
+  Serial.println("Target time (s): " + String(targetTime));
+  Serial.println("Peak speed (m / s): " + String(peakSpeed));
+  Serial.println("Suggested holdDelay (s): " + String(max(0.0f, holdDelay + targetTime - runTime)));
 
-void rampPower(float desiredPower) {
-  float slew = rampRate * deltaTime / 1000.0;
+  LedStatus finalStatus = LedStatus::TimeLimit;
+  if (result == DriveResult::TargetReached) finalStatus = LedStatus::TargetReached;
+  if (result == DriveResult::MovementTimeout) finalStatus = LedStatus::MovementTimeout;
+  setLedStatus(finalStatus);
 
-  if (currentPower < desiredPower) {
-    currentPower = min(currentPower + slew, desiredPower);
-  } else {
-    currentPower = max(currentPower - slew, desiredPower);
-  }
-
-  currentPower = constrain(currentPower, minPower, 255);
-}
-
-void fineAdjust(float targetMeters) {
-  long targetTicks = (long)(targetMeters * ticksPerMeter);
-  long toleranceTicks = (long)(fineTolerance * ticksPerMeter);
-  unsigned long settleStart = 0;
-
-  pidFine.eprev = 0;
-  pidFine.eintegral = 0;
-  prevTime = millis();
-
-  while (1) {
-    computeDeltaT();
-
-    long errorTicks = targetTicks - getEncoderPos();
-
-    if (abs(errorTicks) <= toleranceTicks) {
-      stopMotors();
-      if (settleStart == 0) settleStart = millis();
-      if (millis() - settleStart >= settleTime) break;
-    } else {
-      settleStart = 0;
-
-      int pwr, dir;
-      pidFine.evaluate(getEncoderPos(), targetTicks, deltaTime / 1000.0, pwr, dir);
-      setMotor(dir * forwardDir, pwr);
-    }
-  }
-
-  stopMotors();
-  currentPower = 0;
-}
-
-// ?Motor Control
-void setMotor(int dir, int pwmVal) {
-  analogWrite(motorPWM, pwmVal);
-
-  if (dir == -1) {
-    digitalWrite(motorIN1, HIGH);
-    digitalWrite(motorIN2, LOW);
-  } else if (dir == 1) {
-    digitalWrite(motorIN1, LOW);
-    digitalWrite(motorIN2, HIGH);
-  } else {
-    digitalWrite(motorIN1, LOW);
-    digitalWrite(motorIN2, LOW);
-  }
-}
-
-void stopMotors() {
-  setMotor(0, 0);
-}
-
-void applyBrake(char direction) {
-  if (direction == 'f') {
-    setMotor(-forwardDir, brakePower);
-  } else {
-    setMotor(forwardDir, brakePower);
-  }
-
-  delay(brakeDuration);
-}
-
-// ?Utility Functions
-void computeDeltaT() {
-  long currTime = millis();
-  deltaTime = currTime - prevTime;
-  prevTime = currTime;
-}
-
-long getEncoderPos() {
-  noInterrupts();
-  long pos = encoderPos;
-  interrupts();
-  return pos;
-}
-
-void readEncoder() {
-  int b = digitalRead(encoderB);
-  encoderPos += (b > 0) ? 1 : -1;
+  runComplete = true;
 }

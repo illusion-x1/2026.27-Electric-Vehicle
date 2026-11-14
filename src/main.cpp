@@ -161,7 +161,7 @@ void loop() {
   float bottleGoal = bottleLineDistance - vehicleLength + bottleTrim;  // Measuring point stop for the bottle leg
   float targetGoal = targetDistance + targetTrim;                      // Measuring point stop for the return leg
 
-  while (digitalRead(buttonPin) != HIGH) { updateStatusLed(); delay(1);}
+  while (digitalRead(buttonPin) != LOW) { updateStatusLed(); delay(1);}
 
   runStart = millis();
   noInterrupts();
